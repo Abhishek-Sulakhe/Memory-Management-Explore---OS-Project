@@ -1,0 +1,14 @@
+*.o
+*.ko
+*.mod
+*.mod.c
+*.order
+*.symvers
+*.cmd
+*.tmp
+*.tmp_versions/
+Module.markers
+modules.order
+.DS_Store
+__pycache__/
+
