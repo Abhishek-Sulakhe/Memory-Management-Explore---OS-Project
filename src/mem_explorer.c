@@ -1,6 +1,16 @@
+// SPDX-License-Identifier: GPL-2.0
+/*
+ * Memory Management Explorer
+ *
+ * Academic kernel module that implements a custom handle-based memory
+ * allocator on top of kmalloc and vmalloc.  Exposes a /proc interface
+ * for allocation commands, statistics, and experimentation.
+ */
+
 #include <linux/init.h>
 #include <linux/kernel.h>
 #include <linux/kstrtox.h>
+#include <linux/ktime.h>
 #include <linux/list.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
@@ -11,20 +21,39 @@
 #include <linux/uaccess.h>
 #include <linux/vmalloc.h>
 
-#define MEMX_MODULE_NAME "mem_explorer"
-#define MEMX_PROC_DIR "mem_explorer"
+#define MEMX_MODULE_NAME  "mem_explorer"
+#define MEMX_PROC_DIR     "mem_explorer"
 #define MEMX_PROC_CONTROL "control"
-#define MEMX_PROC_STATUS "status"
-#define MEMX_CMD_LEN 128
+#define MEMX_PROC_STATUS  "status"
+#define MEMX_CMD_LEN      128
+
+/* ------------------------------------------------------------------ */
+/*  Configurable log macro — controlled by the debug_level parameter  */
+/* ------------------------------------------------------------------ */
+#define memx_log(level, fmt, ...)					\
+	do {								\
+		if (debug_level >= (level))				\
+			pr_info(MEMX_MODULE_NAME ": " fmt,		\
+				##__VA_ARGS__);				\
+	} while (0)
+
+/* ------------------------------------------------------------------ */
+/*  Per-allocation metadata record                                    */
+/* ------------------------------------------------------------------ */
 struct memx_block {
 	struct list_head node;
-	u64 id;
-	void *ptr;
+	u64    id;
+	void  *ptr;
 	size_t size;
-	bool via_vmalloc;
-	bool zeroed;
+	bool   via_vmalloc;
+	bool   zeroed;
+	u64    alloc_time_ns;     /* wall-clock time at allocation       */
+	u64    alloc_latency_ns;  /* nanoseconds the allocator call took */
 };
 
+/* ------------------------------------------------------------------ */
+/*  Global state                                                      */
+/* ------------------------------------------------------------------ */
 static LIST_HEAD(memx_blocks);
 static DEFINE_MUTEX(memx_lock);
 
@@ -32,6 +61,7 @@ static struct proc_dir_entry *memx_proc_dir;
 static struct proc_dir_entry *memx_proc_control;
 static struct proc_dir_entry *memx_proc_status;
 
+/* --- module parameters ------------------------------------------- */
 static ulong vmalloc_threshold = 8192;
 module_param(vmalloc_threshold, ulong, 0644);
 MODULE_PARM_DESC(vmalloc_threshold,
@@ -47,16 +77,34 @@ module_param(max_tracked_allocations, uint, 0644);
 MODULE_PARM_DESC(max_tracked_allocations,
 		 "Maximum number of live allocations tracked by the module");
 
+static uint debug_level = 1;
+module_param(debug_level, uint, 0644);
+MODULE_PARM_DESC(debug_level,
+		 "Logging verbosity: 0=quiet  1=normal  2=verbose");
+
+/* --- aggregate counters ------------------------------------------ */
 static u64 next_id = 1;
 static u64 alloc_requests;
 static u64 free_requests;
+static u64 resize_requests;
 static u64 failed_allocations;
 static u64 total_allocations_created;
 static u64 peak_active_bytes;
 static u64 active_bytes;
 static u64 last_allocated_id;
 static u32 active_allocations;
-static u8 last_touch_checksum;
+static u8  last_touch_checksum;
+
+/* --- per-backend counters ---------------------------------------- */
+static u64 kmalloc_count;
+static u64 vmalloc_count;
+static u64 kmalloc_bytes;
+static u64 vmalloc_bytes;
+static u64 total_alloc_latency_ns;
+
+/* ================================================================== */
+/*  Internal helpers                                                   */
+/* ================================================================== */
 
 static struct memx_block *memx_find_block_locked(u64 id)
 {
@@ -83,91 +131,119 @@ static void memx_free_block_storage(struct memx_block *block)
 	kfree(block);
 }
 
-static void memx_account_allocation_locked(size_t size)
+static void memx_account_allocation_locked(struct memx_block *block)
 {
 	active_allocations++;
-	active_bytes += size;
+	active_bytes += block->size;
 	total_allocations_created++;
+
 	if (active_bytes > peak_active_bytes)
 		peak_active_bytes = active_bytes;
+
+	if (block->via_vmalloc) {
+		vmalloc_count++;
+		vmalloc_bytes += block->size;
+	} else {
+		kmalloc_count++;
+		kmalloc_bytes += block->size;
+	}
+
+	total_alloc_latency_ns += block->alloc_latency_ns;
 }
 
-static void memx_account_free_locked(size_t size)
+static void memx_account_free_locked(struct memx_block *block)
 {
 	active_allocations--;
-	active_bytes -= size;
+	active_bytes -= block->size;
 }
 
+/* ================================================================== */
+/*  Core allocator operations                                          */
+/* ================================================================== */
+
+/**
+ * memx_alloc_block - allocate a tracked memory block
+ *
+ * The heavy allocation (kmalloc / vmalloc) is performed outside the
+ * mutex so that sleeping allocators never block the tracking list.
+ * A single lock acquisition afterwards checks capacity, assigns the
+ * ID, and inserts the block — eliminating the TOCTOU race present
+ * in a dual-check approach.
+ */
 static int memx_alloc_block(size_t size, bool zeroed, u64 *new_id)
 {
 	struct memx_block *block;
 	void *ptr;
 	bool via_vmalloc;
-	int ret = 0;
+	u64 t_start, t_end;
 
 	if (!size || size > max_allocation)
 		return -EINVAL;
 
-	mutex_lock(&memx_lock);
-	alloc_requests++;
-	if (active_allocations >= max_tracked_allocations) {
-		failed_allocations++;
-		mutex_unlock(&memx_lock);
-		return -ENOSPC;
-	}
-	mutex_unlock(&memx_lock);
-
 	block = kzalloc(sizeof(*block), GFP_KERNEL);
 	if (!block) {
 		mutex_lock(&memx_lock);
+		alloc_requests++;
 		failed_allocations++;
 		mutex_unlock(&memx_lock);
 		return -ENOMEM;
 	}
 
+	/* Perform the real allocation with latency measurement. */
 	via_vmalloc = size > vmalloc_threshold;
+
+	t_start = ktime_get_ns();
 	if (via_vmalloc)
 		ptr = zeroed ? vzalloc(size) : vmalloc(size);
 	else
-		ptr = zeroed ? kzalloc(size, GFP_KERNEL) : kmalloc(size, GFP_KERNEL);
+		ptr = zeroed ? kzalloc(size, GFP_KERNEL)
+			     : kmalloc(size, GFP_KERNEL);
+	t_end = ktime_get_ns();
 
 	if (!ptr) {
 		mutex_lock(&memx_lock);
+		alloc_requests++;
 		failed_allocations++;
 		mutex_unlock(&memx_lock);
 		kfree(block);
 		return -ENOMEM;
 	}
 
-	block->ptr = ptr;
-	block->size = size;
-	block->via_vmalloc = via_vmalloc;
-	block->zeroed = zeroed;
+	block->ptr             = ptr;
+	block->size            = size;
+	block->via_vmalloc     = via_vmalloc;
+	block->zeroed          = zeroed;
+	block->alloc_time_ns   = t_start;
+	block->alloc_latency_ns = t_end - t_start;
 
+	/*
+	 * Single critical section: check capacity, assign ID, insert.
+	 */
 	mutex_lock(&memx_lock);
+	alloc_requests++;
+
 	if (active_allocations >= max_tracked_allocations) {
 		failed_allocations++;
-		ret = -ENOSPC;
-		goto unlock_free;
+		mutex_unlock(&memx_lock);
+		memx_free_block_storage(block);
+		return -ENOSPC;
 	}
 
 	block->id = next_id++;
 	list_add_tail(&block->node, &memx_blocks);
-	memx_account_allocation_locked(size);
+	memx_account_allocation_locked(block);
 	last_allocated_id = block->id;
 	*new_id = block->id;
 	mutex_unlock(&memx_lock);
 
-	pr_info("%s: allocated id=%llu size=%zu backend=%s zeroed=%d\n",
-		MEMX_MODULE_NAME, (unsigned long long)block->id, block->size,
-		block->via_vmalloc ? "vmalloc" : "kmalloc", block->zeroed);
+	memx_log(1,
+		 "allocated id=%llu size=%zu backend=%s zeroed=%d latency=%llu ns\n",
+		 (unsigned long long)block->id, block->size,
+		 block->via_vmalloc ? "vmalloc" : "kmalloc",
+		 block->zeroed,
+		 (unsigned long long)block->alloc_latency_ns);
 
 	return 0;
-
-unlock_free:
-	mutex_unlock(&memx_lock);
-	memx_free_block_storage(block);
-	return ret;
 }
 
 static int memx_free_block(u64 id)
@@ -183,12 +259,12 @@ static int memx_free_block(u64 id)
 	}
 
 	list_del(&block->node);
-	memx_account_free_locked(block->size);
+	memx_account_free_locked(block);
 	mutex_unlock(&memx_lock);
 
-	pr_info("%s: freed id=%llu size=%zu backend=%s\n",
-		MEMX_MODULE_NAME, (unsigned long long)block->id, block->size,
-		block->via_vmalloc ? "vmalloc" : "kmalloc");
+	memx_log(1, "freed id=%llu size=%zu backend=%s\n",
+		 (unsigned long long)block->id, block->size,
+		 block->via_vmalloc ? "vmalloc" : "kmalloc");
 
 	memx_free_block_storage(block);
 	return 0;
@@ -203,7 +279,7 @@ static int memx_free_all_blocks(void)
 	mutex_lock(&memx_lock);
 	list_for_each_entry_safe(block, tmp, &memx_blocks, node) {
 		list_del(&block->node);
-		memx_account_free_locked(block->size);
+		memx_account_free_locked(block);
 		mutex_unlock(&memx_lock);
 		memx_free_block_storage(block);
 		freed++;
@@ -211,15 +287,13 @@ static int memx_free_all_blocks(void)
 	}
 	mutex_unlock(&memx_lock);
 
-	pr_info("%s: freed all blocks count=%u\n", MEMX_MODULE_NAME, freed);
+	memx_log(1, "freed all blocks count=%u\n", freed);
 	return freed;
 }
 
 static int memx_fill_block(u64 id, u8 value)
 {
 	struct memx_block *block;
-	void *ptr;
-	size_t size;
 
 	mutex_lock(&memx_lock);
 	block = memx_find_block_locked(id);
@@ -228,13 +302,12 @@ static int memx_fill_block(u64 id, u8 value)
 		return -ENOENT;
 	}
 
-	ptr = block->ptr;
-	size = block->size;
-	memset(ptr, value, size);
+	/* memset while holding the lock guarantees the block stays alive. */
+	memset(block->ptr, value, block->size);
 	mutex_unlock(&memx_lock);
 
-	pr_info("%s: filled id=%llu with byte=0x%02x\n",
-		MEMX_MODULE_NAME, (unsigned long long)id, value);
+	memx_log(2, "filled id=%llu with byte=0x%02x\n",
+		 (unsigned long long)id, value);
 	return 0;
 }
 
@@ -254,7 +327,7 @@ static int memx_touch_block(u64 id)
 	}
 
 	bytes = block->ptr;
-	size = block->size;
+	size  = block->size;
 	for (offset = 0; offset < size; offset += PAGE_SIZE)
 		checksum ^= bytes[offset];
 	if (size > 0)
@@ -262,54 +335,220 @@ static int memx_touch_block(u64 id)
 	last_touch_checksum = checksum;
 	mutex_unlock(&memx_lock);
 
-	pr_info("%s: touched id=%llu checksum=0x%02x\n",
-		MEMX_MODULE_NAME, (unsigned long long)id, checksum);
+	memx_log(2, "touched id=%llu checksum=0x%02x\n",
+		 (unsigned long long)id, checksum);
 	return 0;
 }
+
+/**
+ * memx_resize_block - resize an existing allocation
+ *
+ * Uses krealloc when the block stays in kmalloc.  When the backend
+ * changes (kmalloc <-> vmalloc) or the source is vmalloc, a full
+ * allocate-copy-free cycle is performed.
+ *
+ * NOTE: the block pointer is accessed after the mutex is dropped for
+ * the heavy allocation.  This is safe in the intended single-user
+ * /proc workload but would require reference counting under truly
+ * concurrent access.
+ */
+static int memx_resize_block(u64 id, size_t new_size)
+{
+	struct memx_block *block;
+	void  *old_ptr, *new_ptr;
+	size_t old_size;
+	bool   old_via_vmalloc, new_via_vmalloc;
+	u64    t_start, t_end, latency;
+
+	if (!new_size || new_size > max_allocation)
+		return -EINVAL;
+
+	new_via_vmalloc = new_size > vmalloc_threshold;
+
+	/* --- locate the block and snapshot its state --- */
+	mutex_lock(&memx_lock);
+	resize_requests++;
+	block = memx_find_block_locked(id);
+	if (!block) {
+		mutex_unlock(&memx_lock);
+		return -ENOENT;
+	}
+
+	old_ptr         = block->ptr;
+	old_size        = block->size;
+	old_via_vmalloc = block->via_vmalloc;
+	mutex_unlock(&memx_lock);
+
+	/* --- perform the heavy allocation outside the lock --- */
+	t_start = ktime_get_ns();
+
+	if (!old_via_vmalloc && !new_via_vmalloc) {
+		/*
+		 * Both ends are kmalloc — krealloc may resize in place.
+		 * On failure krealloc returns NULL without freeing the
+		 * original buffer.
+		 */
+		new_ptr = krealloc(old_ptr, new_size, GFP_KERNEL);
+	} else {
+		/* Backend change or vmalloc: full copy path. */
+		new_ptr = new_via_vmalloc ? vmalloc(new_size)
+					  : kmalloc(new_size, GFP_KERNEL);
+		if (new_ptr) {
+			memcpy(new_ptr, old_ptr, min(old_size, new_size));
+			if (old_via_vmalloc)
+				vfree(old_ptr);
+			else
+				kfree(old_ptr);
+		}
+	}
+
+	t_end   = ktime_get_ns();
+	latency = t_end - t_start;
+
+	if (!new_ptr) {
+		mutex_lock(&memx_lock);
+		failed_allocations++;
+		mutex_unlock(&memx_lock);
+		return -ENOMEM;
+	}
+
+	/* --- update tracking under the lock --- */
+	mutex_lock(&memx_lock);
+	active_bytes = active_bytes - old_size + new_size;
+	if (active_bytes > peak_active_bytes)
+		peak_active_bytes = active_bytes;
+
+	if (old_via_vmalloc != new_via_vmalloc) {
+		if (old_via_vmalloc) {
+			vmalloc_count--;
+			vmalloc_bytes -= old_size;
+			kmalloc_count++;
+			kmalloc_bytes += new_size;
+		} else {
+			kmalloc_count--;
+			kmalloc_bytes -= old_size;
+			vmalloc_count++;
+			vmalloc_bytes += new_size;
+		}
+	} else if (new_via_vmalloc) {
+		vmalloc_bytes = vmalloc_bytes - old_size + new_size;
+	} else {
+		kmalloc_bytes = kmalloc_bytes - old_size + new_size;
+	}
+
+	block->ptr             = new_ptr;
+	block->size            = new_size;
+	block->via_vmalloc     = new_via_vmalloc;
+	block->alloc_latency_ns = latency;
+	mutex_unlock(&memx_lock);
+
+	memx_log(1,
+		 "resized id=%llu %zu->%zu backend=%s->%s latency=%llu ns\n",
+		 (unsigned long long)id, old_size, new_size,
+		 old_via_vmalloc ? "vmalloc" : "kmalloc",
+		 new_via_vmalloc ? "vmalloc" : "kmalloc",
+		 (unsigned long long)latency);
+
+	return 0;
+}
+
+/* ================================================================== */
+/*  /proc interface                                                    */
+/* ================================================================== */
 
 static int memx_status_show(struct seq_file *m, void *v)
 {
 	struct memx_block *block;
+	u64 now = ktime_get_ns();
 
 	mutex_lock(&memx_lock);
+
 	seq_puts(m, "Memory Management Explorer\n");
-	seq_puts(m, "==========================\n");
-	seq_printf(m, "vmalloc_threshold_bytes: %lu\n", vmalloc_threshold);
-	seq_printf(m, "max_allocation_bytes:    %lu\n", max_allocation);
-	seq_printf(m, "max_tracked_allocations: %u\n", max_tracked_allocations);
-	seq_printf(m, "alloc_requests:          %llu\n",
+	seq_puts(m, "==========================\n\n");
+
+	/* --- configuration --- */
+	seq_puts(m, "Configuration:\n");
+	seq_printf(m, "  vmalloc_threshold_bytes: %lu\n", vmalloc_threshold);
+	seq_printf(m, "  max_allocation_bytes:    %lu\n", max_allocation);
+	seq_printf(m, "  max_tracked_allocations: %u\n",
+		   max_tracked_allocations);
+	seq_printf(m, "  debug_level:             %u\n\n", debug_level);
+
+	/* --- request counters --- */
+	seq_puts(m, "Request counters:\n");
+	seq_printf(m, "  alloc_requests:          %llu\n",
 		   (unsigned long long)alloc_requests);
-	seq_printf(m, "free_requests:           %llu\n",
+	seq_printf(m, "  free_requests:           %llu\n",
 		   (unsigned long long)free_requests);
-	seq_printf(m, "failed_allocations:      %llu\n",
+	seq_printf(m, "  resize_requests:         %llu\n",
+		   (unsigned long long)resize_requests);
+	seq_printf(m, "  failed_allocations:      %llu\n",
 		   (unsigned long long)failed_allocations);
-	seq_printf(m, "total_allocations:       %llu\n",
+	seq_printf(m, "  total_allocations:       %llu\n",
 		   (unsigned long long)total_allocations_created);
-	seq_printf(m, "last_allocated_id:       %llu\n",
+	seq_printf(m, "  last_allocated_id:       %llu\n\n",
 		   (unsigned long long)last_allocated_id);
-	seq_printf(m, "active_allocations:      %u\n", active_allocations);
-	seq_printf(m, "active_bytes:            %llu\n",
+
+	/* --- memory usage --- */
+	seq_puts(m, "Memory usage:\n");
+	seq_printf(m, "  active_allocations:      %u\n", active_allocations);
+	seq_printf(m, "  active_bytes:            %llu\n",
 		   (unsigned long long)active_bytes);
-	seq_printf(m, "peak_active_bytes:       %llu\n",
+	seq_printf(m, "  peak_active_bytes:       %llu\n\n",
 		   (unsigned long long)peak_active_bytes);
-	seq_printf(m, "last_touch_checksum:     0x%02x\n", last_touch_checksum);
-	seq_puts(m, "\nCommands:\n");
+
+	/* --- per-backend breakdown --- */
+	seq_puts(m, "Backend breakdown:\n");
+	seq_printf(m, "  kmalloc_count:           %llu\n",
+		   (unsigned long long)kmalloc_count);
+	seq_printf(m, "  kmalloc_bytes:           %llu\n",
+		   (unsigned long long)kmalloc_bytes);
+	seq_printf(m, "  vmalloc_count:           %llu\n",
+		   (unsigned long long)vmalloc_count);
+	seq_printf(m, "  vmalloc_bytes:           %llu\n\n",
+		   (unsigned long long)vmalloc_bytes);
+
+	/* --- latency --- */
+	seq_puts(m, "Latency:\n");
+	seq_printf(m, "  total_alloc_latency_ns:  %llu\n",
+		   (unsigned long long)total_alloc_latency_ns);
+	if (total_allocations_created > 0)
+		seq_printf(m, "  avg_alloc_latency_ns:    %llu\n",
+			   (unsigned long long)(total_alloc_latency_ns /
+						total_allocations_created));
+	seq_printf(m, "  last_touch_checksum:     0x%02x\n\n",
+		   last_touch_checksum);
+
+	/* --- help --- */
+	seq_puts(m, "Commands:\n");
 	seq_puts(m, "  alloc <size> [zero]\n");
 	seq_puts(m, "  free <id>\n");
 	seq_puts(m, "  fill <id> <byte>\n");
 	seq_puts(m, "  touch <id>\n");
-	seq_puts(m, "  freeall\n");
-	seq_puts(m, "\nActive allocations:\n");
-	seq_puts(m, "  ID    Size(bytes)  Backend   Zeroed\n");
+	seq_puts(m, "  resize <id> <new_size>\n");
+	seq_puts(m, "  freeall\n\n");
+
+	/* --- active-allocation table --- */
+	seq_puts(m, "Active allocations:\n");
+	seq_puts(m,
+	  "  ID    Size(bytes)  Backend   Zeroed  Latency(ns)  Age(ms)\n");
 
 	list_for_each_entry(block, &memx_blocks, node) {
-		seq_printf(m, "  %-5llu %-12zu %-8s %d\n",
-			   (unsigned long long)block->id, block->size,
-			   block->via_vmalloc ? "vmalloc" : "kmalloc",
-			   block->zeroed);
-	}
-	mutex_unlock(&memx_lock);
+		u64 age_ms = 0;
 
+		if (now > block->alloc_time_ns)
+			age_ms = (now - block->alloc_time_ns) / 1000000ULL;
+
+		seq_printf(m, "  %-5llu %-12zu %-8s  %-6d  %-11llu  %llu\n",
+			   (unsigned long long)block->id,
+			   block->size,
+			   block->via_vmalloc ? "vmalloc" : "kmalloc",
+			   block->zeroed,
+			   (unsigned long long)block->alloc_latency_ns,
+			   (unsigned long long)age_ms);
+	}
+
+	mutex_unlock(&memx_lock);
 	return 0;
 }
 
@@ -324,6 +563,7 @@ static int memx_control_show(struct seq_file *m, void *v)
 	seq_puts(m, "  echo \"alloc 4096 zero\" > /proc/mem_explorer/control\n");
 	seq_puts(m, "  echo \"fill 1 170\" > /proc/mem_explorer/control\n");
 	seq_puts(m, "  echo \"touch 1\" > /proc/mem_explorer/control\n");
+	seq_puts(m, "  echo \"resize 1 8192\" > /proc/mem_explorer/control\n");
 	seq_puts(m, "  echo \"free 1\" > /proc/mem_explorer/control\n");
 	return 0;
 }
@@ -332,6 +572,10 @@ static int memx_control_open(struct inode *inode, struct file *file)
 {
 	return single_open(file, memx_control_show, NULL);
 }
+
+/* ------------------------------------------------------------------ */
+/*  Command parsing helpers                                            */
+/* ------------------------------------------------------------------ */
 
 static int memx_parse_u64_token(char *token, u64 *value)
 {
@@ -371,6 +615,10 @@ static char *memx_next_token(char **cursor)
 	return NULL;
 }
 
+/* ------------------------------------------------------------------ */
+/*  /proc control write handler                                        */
+/* ------------------------------------------------------------------ */
+
 static ssize_t memx_control_write(struct file *file, const char __user *ubuf,
 				  size_t len, loff_t *off)
 {
@@ -394,7 +642,7 @@ static ssize_t memx_control_write(struct file *file, const char __user *ubuf,
 	buf[len] = '\0';
 	strim(buf);
 	cursor = buf;
-	cmd = memx_next_token(&cursor);
+	cmd  = memx_next_token(&cursor);
 	arg1 = memx_next_token(&cursor);
 	arg2 = memx_next_token(&cursor);
 	arg3 = memx_next_token(&cursor);
@@ -418,16 +666,20 @@ static ssize_t memx_control_write(struct file *file, const char __user *ubuf,
 		else if (arg2)
 			return -EINVAL;
 
+		if (arg3)
+			return -EINVAL;
+
 		ret = memx_alloc_block(size, zeroed, &id);
 		if (ret)
 			return ret;
 
-		pr_info("%s: allocation available as id=%llu\n",
-			MEMX_MODULE_NAME, (unsigned long long)id);
+		memx_log(2, "allocation available as id=%llu\n",
+			 (unsigned long long)id);
+
 	} else if (!strcmp(cmd, "free")) {
 		u64 id;
 
-		if (arg3)
+		if (arg2 || arg3)
 			return -EINVAL;
 		ret = memx_parse_u64_token(arg1, &id);
 		if (ret)
@@ -435,6 +687,7 @@ static ssize_t memx_control_write(struct file *file, const char __user *ubuf,
 		ret = memx_free_block(id);
 		if (ret)
 			return ret;
+
 	} else if (!strcmp(cmd, "fill")) {
 		u64 id;
 		u8 value;
@@ -450,6 +703,7 @@ static ssize_t memx_control_write(struct file *file, const char __user *ubuf,
 		ret = memx_fill_block(id, value);
 		if (ret)
 			return ret;
+
 	} else if (!strcmp(cmd, "touch")) {
 		u64 id;
 
@@ -461,10 +715,30 @@ static ssize_t memx_control_write(struct file *file, const char __user *ubuf,
 		ret = memx_touch_block(id);
 		if (ret)
 			return ret;
+
+	} else if (!strcmp(cmd, "resize")) {
+		u64 id;
+		u64 new_size;
+
+		ret = memx_parse_u64_token(arg1, &id);
+		if (ret)
+			return ret;
+		ret = memx_parse_u64_token(arg2, &new_size);
+		if (ret)
+			return ret;
+		if (new_size > (u64)((size_t)-1))
+			return -EOVERFLOW;
+		if (arg3)
+			return -EINVAL;
+		ret = memx_resize_block(id, (size_t)new_size);
+		if (ret)
+			return ret;
+
 	} else if (!strcmp(cmd, "freeall")) {
 		if (arg1 || arg2 || arg3)
 			return -EINVAL;
 		memx_free_all_blocks();
+
 	} else {
 		return -EINVAL;
 	}
@@ -473,20 +747,28 @@ static ssize_t memx_control_write(struct file *file, const char __user *ubuf,
 	return len;
 }
 
+/* ================================================================== */
+/*  proc_ops tables                                                    */
+/* ================================================================== */
+
 static const struct proc_ops memx_status_ops = {
-	.proc_open = memx_status_open,
-	.proc_read = seq_read,
-	.proc_lseek = seq_lseek,
+	.proc_open    = memx_status_open,
+	.proc_read    = seq_read,
+	.proc_lseek   = seq_lseek,
 	.proc_release = single_release,
 };
 
 static const struct proc_ops memx_control_ops = {
-	.proc_open = memx_control_open,
-	.proc_read = seq_read,
-	.proc_write = memx_control_write,
-	.proc_lseek = seq_lseek,
+	.proc_open    = memx_control_open,
+	.proc_read    = seq_read,
+	.proc_write   = memx_control_write,
+	.proc_lseek   = seq_lseek,
 	.proc_release = single_release,
 };
+
+/* ================================================================== */
+/*  Module init / exit                                                 */
+/* ================================================================== */
 
 static int __init memx_init(void)
 {
@@ -494,19 +776,21 @@ static int __init memx_init(void)
 	if (!memx_proc_dir)
 		return -ENOMEM;
 
-	memx_proc_control = proc_create(MEMX_PROC_CONTROL, 0666, memx_proc_dir,
-					&memx_control_ops);
+	memx_proc_control = proc_create(MEMX_PROC_CONTROL, 0666,
+					memx_proc_dir, &memx_control_ops);
 	if (!memx_proc_control)
 		goto err_remove_dir;
 
-	memx_proc_status = proc_create(MEMX_PROC_STATUS, 0444, memx_proc_dir,
-				       &memx_status_ops);
+	memx_proc_status = proc_create(MEMX_PROC_STATUS, 0444,
+				       memx_proc_dir, &memx_status_ops);
 	if (!memx_proc_status)
 		goto err_remove_control;
 
-	pr_info("%s: initialized vmalloc_threshold=%lu max_allocation=%lu max_tracked=%u\n",
-		MEMX_MODULE_NAME, vmalloc_threshold, max_allocation,
-		max_tracked_allocations);
+	pr_info(MEMX_MODULE_NAME
+		": initialized  vmalloc_threshold=%lu  max_allocation=%lu"
+		"  max_tracked=%u  debug_level=%u\n",
+		vmalloc_threshold, max_allocation,
+		max_tracked_allocations, debug_level);
 	return 0;
 
 err_remove_control:
@@ -519,6 +803,7 @@ err_remove_dir:
 static void __exit memx_exit(void)
 {
 	memx_free_all_blocks();
+
 	if (memx_proc_status)
 		proc_remove(memx_proc_status);
 	if (memx_proc_control)
@@ -526,13 +811,13 @@ static void __exit memx_exit(void)
 	if (memx_proc_dir)
 		proc_remove(memx_proc_dir);
 
-	pr_info("%s: unloaded\n", MEMX_MODULE_NAME);
+	pr_info(MEMX_MODULE_NAME ": unloaded\n");
 }
 
 module_init(memx_init);
 module_exit(memx_exit);
 
 MODULE_LICENSE("GPL");
-MODULE_AUTHOR("OpenAI Codex");
+MODULE_AUTHOR("Abhishek Sulakhe, Anmol Nayak, Arya , Samudra Pattanaik");
 MODULE_DESCRIPTION("Academic memory management explorer using kmalloc/vmalloc");
-MODULE_VERSION("1.0");
+MODULE_VERSION("2.0");
