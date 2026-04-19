@@ -142,18 +142,3 @@ sudo rmmod mem_explorer
 - It keeps explicit allocation metadata to avoid double free and stale-handle
   usage.
 - All live allocations are reclaimed during module unload.
-
-## Academic angle
-
-This project is appropriate for topics such as:
-
-- kernel heap management
-- physical versus virtual contiguity
-- allocator threshold design
-- allocation latency measurement and comparison
-- synchronization in kernel subsystems
-- memory usage instrumentation and experimentation
-- `krealloc` behavior and backend migration
-
-See `docs/report.md` for a full academic write-up you can adapt into your
-submission.
